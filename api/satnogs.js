@@ -1,8 +1,10 @@
 // Vercel serverless function: GET /api/satnogs
 // Pulls real observation data from the SatNOGS Network (https://network.satnogs.org),
 // an open worldwide network of volunteer satellite ground stations.
-// Returns observations scheduled or running in the next hours, and recent successful receptions.
-// Cached for 15 minutes so we stay well inside SatNOGS' anonymous limit (60 requests per hour).
+// Returns observations running now or coming up soon, and recent successful receptions.
+// SatNOGS lists observations newest-first, 25 per page, so we ask for several short time
+// windows to get the ones closest to now. Cached for 15 minutes to stay well inside
+// SatNOGS' anonymous limit (60 requests per hour).
 const BASE = 'https://network.satnogs.org/api/observations/?format=json';
 const keep = o => ({
   id: o.id, start: o.start, end: o.end, status: o.status,
@@ -24,11 +26,14 @@ async function get(url, ms) {
   } finally { clearTimeout(timer); }
 }
 async function handler(req, res) {
-  const now = Date.now(), iso = t => new Date(t).toISOString().slice(0, 19) + 'Z';
+  const now = Date.now(), iso = t => new Date(t).toISOString().slice(0, 19) + 'Z', min = 60000;
+  const win = (a, b) => get(`${BASE}&start=${iso(now + a * min)}&end=${iso(now + b * min)}`, 12000);
   const jobs = [
-    get(`${BASE}&status=future&start=${iso(now - 30 * 60000)}&end=${iso(now + 8 * 3600000)}`, 12000),
-    get(`${BASE}&status=good&end=${iso(now)}`, 12000),
-    get(BASE, 12000)   // plain latest list, as a backup if the filtered queries fail
+    win(-30, 20),   // running now or ending very soon
+    win(-30, 45),
+    win(-15, 90),
+    win(0, 180),
+    get(`${BASE}&status=good&end=${iso(now)}`, 12000)
   ];
   const out = await Promise.allSettled(jobs);
   const ok = out.filter(x => x.status === 'fulfilled');
@@ -37,10 +42,11 @@ async function handler(req, res) {
     return res.status(502).json({ error: out.map(x => x.reason && (x.reason.name === 'AbortError' ? 'SatNOGS took too long to answer' : x.reason.message)).join('; ') });
   }
   const val = i => out[i].status === 'fulfilled' ? out[i].value : [];
-  const backup = val(2), t = Date.now();
-  let upcoming = val(0), recent = val(1);
-  if (!upcoming.length) upcoming = backup.filter(o => Date.parse(o.end) > t);
-  if (!recent.length) recent = backup.filter(o => o.status === 'good');
+  const seen = new Set(), t = Date.now();
+  const upcoming = [0, 1, 2, 3].flatMap(val)
+    .filter(o => !seen.has(o.id) && seen.add(o.id) && Date.parse(o.end) > t && o.status !== 'failed' && o.status !== 'bad')
+    .sort((a, b) => Date.parse(a.start) - Date.parse(b.start));
+  const recent = val(4);
   res.setHeader('Cache-Control', 's-maxage=900, stale-while-revalidate=3600');
   res.status(200).json({ source: 'network.satnogs.org', fetched: new Date().toISOString(), upcoming: upcoming.map(keep), recent: recent.map(keep), partial: ok.length < jobs.length });
 }
