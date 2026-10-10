@@ -4,15 +4,33 @@
   Mirrors one ground station from the OrbitSlot dashboard over USB serial
   and lets you inject faults by handling the board.
 
-  Parts: ESP32 dev board, SSD1306 128x64 I2C OLED, MPU6050, 1 LED + 220 ohm
-         resistor, 1 buzzer (active or passive).
+  Parts: ESP32 dev board, SSD1306 128x64 I2C OLED, MPU6050,
+         1 green LED + 1 red LED (each with a 220 ohm resistor), 1 buzzer (active or passive).
 
   Wiring (ESP32 DevKit):
     OLED VCC -> 3V3     OLED GND -> GND    OLED SDA -> GPIO21   OLED SCL -> GPIO22
     MPU  VCC -> 3V3     MPU  GND -> GND    MPU  SDA -> GPIO21   MPU  SCL -> GPIO22
-    LED  long leg (+) -> 220 ohm -> GPIO25,   LED short leg (-) -> GND
-    Buzzer (+) -> GPIO26,  Buzzer (-) -> GND
+    Green LED long leg (+) -> 220 ohm -> GPIO26 (D26),  short leg (-) -> GND
+    Red   LED long leg (+) -> 220 ohm -> GPIO25 (D25),  short leg (-) -> GND
+    Buzzer (+) -> GPIO27 (D27),  Buzzer (-) -> GND
   (OLED and MPU6050 share the same I2C bus: OLED at 0x3C, MPU6050 at 0x68.)
+
+  What the LEDs mean:
+    GREEN steady         -> downlink in progress (medium or low priority data)
+    GREEN fast flicker   -> downlink in progress with HIGH priority data
+    GREEN short blink    -> idle but connected to the dashboard (heartbeat every 2 s)
+    RED steady           -> station OFFLINE (board turned face-down, or failure in dashboard)
+    RED fast blink (3 s) -> a high-priority deadline was just missed
+    RED double flash     -> urgent requests are waiting to be delivered
+    GREEN + RED alternate slowly -> not connected to the dashboard yet
+
+  What the buzzer does (same as before):
+    1 short chirp        -> a downlink starts
+    3 beeps              -> new urgent requests arrived
+    1 long low tone      -> a high-priority deadline was missed
+    2 falling tones      -> station went offline
+    3 rising tones       -> station back online
+    At power-on: both LEDs light, then 3 beeps (self-test)
 
   Libraries (Arduino Library Manager):
     Adafruit SSD1306, Adafruit GFX Library, ArduinoJson (v7)
@@ -33,8 +51,9 @@
 #include <Adafruit_SSD1306.h>
 #include <ArduinoJson.h>
 
-#define LED_PIN     25
-#define BUZZER_PIN  26
+#define GREEN_LED   26
+#define RED_LED     25
+#define BUZZER_PIN  27
 #define MPU_ADDR    0x68
 #define OLED_ADDR   0x3C
 
@@ -45,10 +64,10 @@ struct State {
   char st[20]   = "Waiting";
   char sch[16]  = "OrbitSlot";
   char mode[6]  = "WAIT";
-  char sat[10]  = "";
+  char sat[16]  = "";
   int  pri      = -1;
   int  pct      = 0;
-  char next[20] = "";
+  char next[24] = "";
   int  el       = -1;
   int  urg      = 0;
   int  miss     = 0;
@@ -56,7 +75,7 @@ struct State {
 
 String line;
 unsigned long lastRx = 0, lastImuSend = 0, lastDraw = 0, lastShake = 0;
-unsigned long faceDownSince = 0, faceUpSince = 0;
+unsigned long faceDownSince = 0, faceUpSince = 0, missFlashUntil = 0;
 bool reportedDown = false, mpuOk = false, firstMsg = true;
 int prevUrg = 0, prevMiss = 0;
 char prevMode[6] = "WAIT";
@@ -121,7 +140,7 @@ void handleMessage(const String &msg) {
     strlcpy(prevMode, S.mode, sizeof(prevMode));
   }
   if (S.urg > prevUrg) alarmUrgent();
-  if (S.miss > prevMiss) alarmMiss();
+  if (S.miss > prevMiss) { alarmMiss(); missFlashUntil = millis() + 3000; }
   prevUrg = S.urg; prevMiss = S.miss;
 }
 
@@ -167,13 +186,28 @@ void readGestures() {
   }
 }
 
-/* ---------------- LED ---------------- */
-void updateLed() {
+/* ---------------- LEDs ---------------- */
+void updateLeds() {
   unsigned long now = millis();
-  bool on = false;
-  if (!strcmp(S.mode, "LINK")) on = (S.pri == 0) ? ((now / 120) % 2) : true;   // flicker for high priority
-  else if (!strcmp(S.mode, "OFF")) on = (now / 600) % 2;                        // slow blink when offline
-  digitalWrite(LED_PIN, on ? HIGH : LOW);
+  bool linked = !firstMsg && now - lastRx < 3000;
+  bool green = false, red = false;
+
+  if (!linked) {
+    // Not connected yet: green and red alternate slowly
+    bool phase = (now / 700) % 2;
+    green = phase; red = !phase;
+  } else {
+    // GREEN: downlink status
+    if (!strcmp(S.mode, "LINK")) green = (S.pri == 0) ? ((now / 120) % 2) : true;
+    else if (!strcmp(S.mode, "IDLE")) green = (now % 2000) < 80;      // heartbeat blink
+
+    // RED: problems, in order of importance
+    if (now < missFlashUntil) red = (now / 100) % 2;                  // deadline just missed
+    else if (!strcmp(S.mode, "OFF")) red = true;                      // station offline
+    else if (S.urg > 0) { unsigned long p = now % 2000; red = p < 90 || (p > 220 && p < 310); }  // urgent waiting
+  }
+  digitalWrite(GREEN_LED, green ? HIGH : LOW);
+  digitalWrite(RED_LED, red ? HIGH : LOW);
 }
 
 /* ---------------- OLED ---------------- */
@@ -208,18 +242,20 @@ void drawScreen() {
   oled.setTextColor(SSD1306_WHITE);
 
   if (!strcmp(S.mode, "LINK")) {
-    oled.setTextSize(2); oled.setCursor(0, 25); oled.print(S.sat);
+    char sat[8]; strlcpy(sat, S.sat, sizeof(sat));          // fits size-2 text
+    oled.setTextSize(2); oled.setCursor(0, 25); oled.print(sat);
     oled.setTextSize(1); oled.setCursor(92, 29);
     oled.print(S.pri == 0 ? "HIGH" : S.pri == 1 ? "MED" : "LOW");
     oled.drawRect(0, 43, 100, 6, SSD1306_WHITE);
-    oled.fillRect(0, 43, S.pct, 6, SSD1306_WHITE);
+    oled.fillRect(0, 43, constrain(S.pct, 0, 100), 6, SSD1306_WHITE);
     oled.setCursor(104, 42); oled.print(S.pct); oled.print("%");
   } else if (!strcmp(S.mode, "OFF")) {
     oled.setTextSize(2); oled.setCursor(0, 25); oled.print("OFFLINE");
     oled.setTextSize(1); oled.setCursor(0, 43); oled.print("Flip board up");
   } else {
     oled.setCursor(0, 27); oled.print("Idle. Next:");
-    oled.setCursor(0, 38); oled.print(S.next);
+    char nx[22]; strlcpy(nx, S.next, sizeof(nx));
+    oled.setCursor(0, 38); oled.print(nx);
   }
 
   oled.setCursor(0, 55);
@@ -230,23 +266,32 @@ void drawScreen() {
   oled.display();
 }
 
+/* ---------------- Power-on self-test ---------------- */
+void selfTest() {
+  digitalWrite(GREEN_LED, HIGH); digitalWrite(RED_LED, HIGH);
+  for (int i = 0; i < 3; i++) beep(2000, 80);       // 3 beeps
+  delay(200);
+  digitalWrite(GREEN_LED, LOW); digitalWrite(RED_LED, LOW);
+}
+
 void setup() {
   Serial.begin(115200);
-  pinMode(LED_PIN, OUTPUT);
+  pinMode(GREEN_LED, OUTPUT);
+  pinMode(RED_LED, OUTPUT);
   pinMode(BUZZER_PIN, OUTPUT);
   Wire.begin(21, 22);
   if (!oled.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
-    // OLED missing: keep running so LED, buzzer and MPU still work
+    // OLED missing: keep running so LEDs, buzzer and MPU still work
   }
   oled.clearDisplay(); oled.display();
   mpuOk = mpuInit();
-  chirpRestore();
+  selfTest();
   Serial.println("{\"ev\":\"hello\"}");
 }
 
 void loop() {
   readSerial();
   readGestures();
-  updateLed();
+  updateLeds();
   if (millis() - lastDraw > 100) { lastDraw = millis(); drawScreen(); }
 }
